@@ -14,9 +14,10 @@
 # limitations under the License.
 #
 
+import torch
 from .utils import *
 from .thresholding import GroupThresholdMixin, threshold_mask, group_threshold_mask
-from .config import file_config, dict_config
+from .config import file_config, dict_config, config_component_from_file_by_class
 from .model_summaries import *
 from .scheduler import *
 from .sensitivity import *
@@ -24,13 +25,20 @@ from .directives import *
 from .policy import *
 from .thinning import *
 from .knowledge_distillation import KnowledgeDistillationPolicy, DistillationLossWeights
-
+from .summary_graph import SummaryGraph, onnx_name_2_pytorch_name
+from .early_exit import EarlyExitMgr
+import pkg_resources
+import logging
+logging.captureWarnings(True)
 
 del dict_config
 del thinning
 
 # Distiller version
-__version__ = "0.3.0-pre"
+try:
+    __version__ = pkg_resources.require("distiller")[0].version
+except pkg_resources.DistributionNotFound:
+    __version__ = "Unknown"
 
 
 def model_find_param_name(model, param_to_find):
@@ -95,3 +103,18 @@ def model_find_module(model, module_to_find):
         if name == module_to_find:
             return m
     return None
+
+
+def check_pytorch_version():
+    from pkg_resources import parse_version
+    required = '1.3.1'
+    actual = torch.__version__
+    if parse_version(actual) < parse_version(required):
+        msg = "\n\nWRONG PYTORCH VERSION\n"\
+              "Required:  {}\n" \
+              "Installed: {}\n"\
+              "Please run 'pip install -e .' from the Distiller repo root dir\n".format(required, actual)
+        raise RuntimeError(msg)
+
+
+check_pytorch_version()

@@ -18,70 +18,29 @@
 
 This implements the scheduling of the compression policies.
 """
-from functools import partial
+import contextlib
 import logging
 import torch
 from .quantization.quantizer import FP_BKP_PREFIX
 from .policy import PolicyLoss, LossComponent
+from .utils import model_device, normalize_module_name
 
+
+__all__ = ["CompressionScheduler", "ParameterMasker", "create_model_masks_dict"]
 msglogger = logging.getLogger()
-
-
-class ParameterMasker(object):
-    def __init__(self, param_name):
-        msglogger.debug('Created masker for parameter {0}'.format(param_name))
-        self.mask = None                # Mask lazily initialized by pruners
-        self.param_name = param_name    # For debug/logging purposes
-        self.is_regularization_mask = False
-        self.use_double_copies = False
-        self.mask_on_forward_only = False
-        self.unmasked_copy = None
-
-    def apply_mask(self, tensor):
-        """Apply a mask on the weights tensor."""
-        if self.mask is None:
-            msglogger.debug('No mask for parameter {0}'.format(self.param_name))
-            return
-        msglogger.debug('Masking parameter {0}'.format(self.param_name))
-        if self.use_double_copies:
-            self.unmasked_copy = tensor.clone()
-        tensor.data.mul_(self.mask)
-        if self.is_regularization_mask:
-            self.mask = None
-        return tensor
-
-    def remove_mask(self, tensor):
-        if self.mask is None:
-            msglogger.debug('No mask for parameter {0}'.format(self.param_name))
-            return
-        if not self.use_double_copies:
-            msglogger.debug('Parameter {0} does not maintain double copies'.format(self.param_name))
-            return
-        tensor.data = self.unmasked_copy.data
-
-
-def create_model_masks_dict(model):
-    """A convinience function to create a dictionary of paramter maskers for a model"""
-    zeros_mask_dict = {}
-    for name, param in model.named_parameters():
-        masker = ParameterMasker(name)
-        zeros_mask_dict[name] = masker
-    return zeros_mask_dict
 
 
 class CompressionScheduler(object):
     """Responsible for scheduling pruning and masking parameters.
 
     """
-    def __init__(self, model, device=torch.device("cuda")):
+    def __init__(self, model, zeros_mask_dict=None, device=torch.device("cuda")):
         self.model = model
         self.device = device
         self.policies = {}
         self.sched_metadata = {}
-        self.zeros_mask_dict = {}
-        for name, param in self.model.named_parameters():
-            masker = ParameterMasker(name)
-            self.zeros_mask_dict[name] = masker
+        # Create the masker objects and place them in a dictionary indexed by the parameter name
+        self.zeros_mask_dict = zeros_mask_dict or create_model_masks_dict(model)
 
     def add_policy(self, policy, epochs=None, starting_epoch=0, ending_epoch=1, frequency=1):
         """Add a new policy to the schedule.
@@ -104,12 +63,12 @@ class CompressionScheduler(object):
                                        'ending_epoch': ending_epoch,
                                        'frequency': frequency}
 
-    def on_epoch_begin(self, epoch, optimizer=None):
-        if epoch in self.policies:
-            for policy in self.policies[epoch]:
-                meta = self.sched_metadata[policy]
-                meta['current_epoch'] = epoch
-                policy.on_epoch_begin(self.model, self.zeros_mask_dict, meta)
+    def on_epoch_begin(self, epoch, optimizer=None, **kwargs):
+        for policy in self.policies.get(epoch, list()):
+            meta = self.sched_metadata[policy]
+            meta['current_epoch'] = epoch
+            policy.on_epoch_begin(self.model, self.zeros_mask_dict, meta,
+                                  **kwargs)
 
     def on_minibatch_begin(self, epoch, minibatch_id, minibatches_per_epoch, optimizer=None):
         if epoch in self.policies:
@@ -138,6 +97,14 @@ class CompressionScheduler(object):
 
         return overall_loss
 
+    def before_parameter_optimization(self, epoch, minibatch_id, minibatches_per_epoch, optimizer):
+        if epoch in self.policies:
+            for policy in self.policies[epoch]:
+                meta = self.sched_metadata[policy]
+                meta['current_epoch'] = epoch
+                policy.before_parameter_optimization(self.model, epoch, minibatch_id, minibatches_per_epoch,
+                                                     self.zeros_mask_dict, meta, optimizer)
+
     def on_minibatch_end(self, epoch, minibatch_id, minibatches_per_epoch, optimizer=None):
         # When we get to this point, the weights are no longer masked.  This is because during the backward
         # pass, the weights may have been updated.  This is true even when the gradients are zero, for some
@@ -146,33 +113,47 @@ class CompressionScheduler(object):
         #
         # Therefore we choose to always apply the pruning mask.  In the future we may optimize this by applying
         # the mask only if the some policy is actually using the mask.
-        self.apply_mask(is_forward=False)
+        self.mask_all_weights(is_forward=False)
         if epoch in self.policies:
             for policy in self.policies[epoch]:
                 policy.on_minibatch_end(self.model, epoch, minibatch_id, minibatches_per_epoch,
                                         self.zeros_mask_dict, optimizer)
 
-    def on_epoch_end(self, epoch, optimizer=None):
-        if epoch in self.policies:
-            for policy in self.policies[epoch]:
-                meta = self.sched_metadata[policy]
-                meta['current_epoch'] = epoch
-                meta['optimizer'] = optimizer
-                policy.on_epoch_end(self.model, self.zeros_mask_dict, meta)
+    def on_epoch_end(self, epoch, optimizer=None, **kwargs):
+        for policy in self.policies.get(epoch, list()):
+            meta = self.sched_metadata[policy]
+            meta['current_epoch'] = epoch
+            meta['optimizer'] = optimizer
+            policy.on_epoch_end(self.model, self.zeros_mask_dict, meta,
+                                **kwargs)
 
-    def apply_mask(self, is_forward=True):
+    def mask_all_weights(self, is_forward=True):
         for name, param in self.model.named_parameters():
             try:
-                if is_forward or not self.zeros_mask_dict[name].mask_on_forward_only:
+                masker = self.zeros_mask_dict[name]
+                if is_forward or not masker.mask_on_forward_only:
                     # When we mask on forward-pass only, we allow the gradients to change
                     # the weights.
-                    self.zeros_mask_dict[name].apply_mask(param)
+                    masker.mask_tensor(param)
             except KeyError:
-                # Quantizers for training modify some model parameters by adding a prefix
-                # If this is the source of the error, workaround and move on
+                # Quantizers for training might modify model parameters in a couple of ways:
+                #   1. By adding a prefix to the parameter tensor name
+                #   2. By wrapping the module holding the parameter in a wrapper module
+                # If the source of the error is one of the above, workaround and move on
+                #
+                # Quantizers might also add new learnable parameters (e.g. the clip value in PACT quantization)
+                # These parameters will also be missing from the masks mapping. For now, we'll assume that we're
+                # not interested in pruning these parameters - and we just ignore them.
+                #
+                # TODO: This is not scalable at all. Find a solution that doesn't "hard-code" these conditions...
                 name_parts = name.split('.')
-                if name_parts[-1].startswith(FP_BKP_PREFIX):
-                    name_parts[-1] = name_parts[-1].replace(FP_BKP_PREFIX, '', 1)
+                prefixed = name_parts[-1].startswith(FP_BKP_PREFIX)
+                wrapped = name_parts[-2] == 'wrapped_module'
+                if prefixed or wrapped:
+                    if prefixed:
+                        name_parts[-1] = name_parts[-1].replace(FP_BKP_PREFIX, '', 1)
+                    if wrapped:
+                        name_parts.pop(-2)
                     name = '.'.join(name_parts)
                     self.zeros_mask_dict[name].apply_mask(param)
 
@@ -187,29 +168,51 @@ class CompressionScheduler(object):
         state = {'masks_dict': masks}
         return state
 
-    def load_state_dict(self, state):
+    def load_state_dict(self, state, normalize_dataparallel_keys=False):
         """Loads the scheduler state.
 
         Currently the scheduler state is comprised only of the set of pruning masks.
 
-        Arguments:
+        Args:
             state_dict (dict): scheduler state. Should be an object returned
-                from a call to :meth:`state_dict`.  It is a dictionary of parameter
+                from a call to :meth:`state_dict`. It is a dictionary of parameter
                 names (keys) and parameter masks (values).
+            normalize_dataparallel_keys (bool): indicates if we should convert the keys from
+                DataParallel format.  This should be set to True when loading a model
+                from a GPU-checkpoint onto a CPU (because currently we don't use DataParallel
+                on the CPU).
         """
         try:
             loaded_masks = state['masks_dict']
-        except Exception as exception:
-            print("ERROR: could not load the CompressionScheduler state")
-            print("Exception: %s %s" % (type(exception), exception))
-            print("\t\tFound the following keys in the state dictionary:")
-            for k in state.keys():
-                print("\t\t" + k)
-            exit(1)
+        except KeyError as exception:
+            msglogger.error('could not load the CompressionScheduler state.'
+                            ' masks_dict is missing from state')
+            with contextlib.suppress(TypeError):
+                msglogger.debug('Scheduler state keys are: {}'.format(', '.join(state)))
+            raise
 
+        if normalize_dataparallel_keys:
+            loaded_masks = {normalize_module_name(k): v for k, v in loaded_masks.items()}
+        device = model_device(self.model)
         for name, mask in self.zeros_mask_dict.items():
             masker = self.zeros_mask_dict[name]
             masker.mask = loaded_masks[name]
+            if masker.mask is not None:
+                masker.mask = masker.mask.to(device)
+
+    def init_from_masks_dict(self, masks_dict, normalize_dataparallel_keys=False):
+        """This is a convenience function to initialize a CompressionScheduler from a dictionary
+
+        Args:
+            masks_dict (list): A dictionary formatted as {parameter_name: 4D mask tensor}
+            normalize_dataparallel_keys (bool): indicates if we should convert the keys from
+                DataParallel format.
+        """
+        for name, mask in self.zeros_mask_dict.items():
+            if name not in masks_dict:
+                masks_dict[name] = None
+        state = {'masks_dict': masks_dict}
+        self.load_state_dict(state, normalize_dataparallel_keys)
 
     @staticmethod
     def verify_policy_loss(policy_loss):
@@ -223,3 +226,53 @@ class CompressionScheduler(object):
             raise TypeError("Expected an instance of " + LossComponent.__name__ +
                             " or a list of such instances")
         return curr_loss_components
+
+
+class ParameterMasker(object):
+    """A ParameterMasker can mask a parameter tensor or a gradients tensor.
+
+    It is used when pruning DNN weights.
+    """
+    def __init__(self, param_name):
+        self.mask = None                # Mask lazily initialized by pruners
+        self.param_name = param_name    # For debug/logging purposes
+        self.is_regularization_mask = False
+        self.use_double_copies = False
+        self.mask_on_forward_only = False
+        self.unmasked_copy = None
+        self.backward_hook_handle = None
+
+    def apply_mask(self, parameter):
+        """Apply a mask on the weights tensor (parameter)."""
+        if self.mask is None:
+            return
+        if self.use_double_copies:
+            self.unmasked_copy = parameter.clone().detach()
+        self.mask_tensor(parameter)
+        if self.is_regularization_mask:
+            self.mask = None
+        return parameter
+
+    def mask_tensor(self, tensor):
+        if self.mask is not None:
+            tensor.data.mul_(self.mask)
+
+    def mask_gradient(self, gradient):
+        if self.mask is not None:
+            return gradient.mul(self.mask)
+
+    def revert_weights(self, parameter):
+        if not self.use_double_copies or self.unmasked_copy is None:
+            msglogger.debug('Parameter {0} does not maintain double copies'.format(self.param_name))
+            return
+        parameter.data.copy_(self.unmasked_copy)
+        self.unmasked_copy = None
+
+
+def create_model_masks_dict(model):
+    """A convenience function to create a dictionary of parameter maskers for a model"""
+    zeros_mask_dict = {}
+    for name, param in model.named_parameters():
+        masker = ParameterMasker(name)
+        zeros_mask_dict[name] = masker
+    return zeros_mask_dict
